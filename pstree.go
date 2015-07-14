@@ -1,19 +1,27 @@
 // package pstree provides an API to retrieve the process tree of a given
 // process-id.
+// Modified for usage with Bosun http://bosun.org
+
 package pstree
 
 import (
-	"fmt"
+	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 )
 
 // New returns the whole system process tree.
 func New() (*Tree, error) {
-	files, err := filepath.Glob("/proc/[0-9]*")
+	return NewFromDir("/proc")
+}
+
+// NewFromDir allows to test from different directory
+func NewFromDir(procPath string) (*Tree, error) {
+	files, err := filepath.Glob(procPath + "/[0-9]*")
 	if err != nil {
 		return nil, err
 	}
@@ -59,73 +67,46 @@ func New() (*Tree, error) {
 	return tree, err
 }
 
-const (
-	statfmt = "%d %s %c %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d"
-)
-
 func scan(dir string) (Process, error) {
-	f, err := os.Open(filepath.Join(dir, "stat"))
+	process := Process{}
+	fileStat, err := os.Stat(dir + "/status")
 	if err != nil {
-		// process vanished since Glob.
-		return Process{}, nil
-	}
-	defer f.Close()
-
-	// see: http://man7.org/linux/man-pages/man5/proc.5.html
-	stat := struct {
-		pid       int    // process ID
-		comm      string // filename of the executable in parentheses
-		state     byte   // process state
-		ppid      int    // pid of the parent process
-		pgrp      int    // process group ID of the process
-		session   int    // session ID of the process
-		tty       int    // controlling terminal of the process
-		tpgid     int    // ID of foreground process group
-		flags     uint32 // kernel flags word of the process
-		minflt    uint64 // number of minor faults the process has made which have not required loading a memory page from disk
-		cminflt   uint64 // number of minor faults the process's waited-for children have made
-		majflt    uint64 // number of major faults the process has made which have required loading a memory page from disk
-		cmajflt   uint64 // number of major faults the process's waited-for children have made
-		utime     uint64 // user time in clock ticks
-		stime     uint64 // system time in clock ticks
-		cutime    int64  // children user time in clock ticks
-		cstime    int64  // children system time in clock ticks
-		priority  int64  // priority
-		nice      int64  // the nice value
-		nthreads  int64  // number of threads in this process
-		itrealval int64  // time in jiffies before next SIGALRM is sent to the process dure to an interval timer
-		starttime int64  // time the process started after system boot in clock ticks
-		vsize     uint64 // virtual memory size in bytes
-		rss       int64  // resident set size: number of pages the process has in real memory
-	}{}
-
-	_, err = fmt.Fscanf(
-		f, statfmt,
-		&stat.pid, &stat.comm, &stat.state,
-		&stat.ppid, &stat.pgrp, &stat.session,
-		&stat.tty, &stat.tpgid, &stat.flags,
-		&stat.minflt, &stat.cminflt, &stat.majflt, &stat.cmajflt,
-		&stat.utime, &stat.stime,
-		&stat.cutime, &stat.cstime,
-		&stat.priority,
-		&stat.nice,
-		&stat.nthreads,
-		&stat.itrealval, &stat.starttime,
-		&stat.vsize, &stat.rss,
-	)
-	if err != nil {
+		// process vanished
+		//		return Process{}, nil
 		return Process{}, err
 	}
-
-	name := stat.comm
-	if strings.HasPrefix(name, "(") && strings.HasSuffix(name, ")") {
-		name = name[1 : len(name)-1]
+	process.StartTime = fileStat.ModTime().Unix()
+	contents, err := ioutil.ReadFile(dir + "/status")
+	if err != nil {
+		//		return Process{}, err
+		return Process{}, err
 	}
-	return Process{
-		Name:   name,
-		Pid:    stat.pid,
-		Parent: stat.ppid,
-	}, err
+	lines := strings.Split(string(contents), "\n")
+	for _, line := range lines {
+		tabParts := strings.SplitN(line, "\t", 2)
+		if len(tabParts) < 2 {
+			continue
+		}
+		value := tabParts[1]
+		switch strings.TrimRight(tabParts[0], ":") {
+		case "Name":
+			process.Name = strings.Trim(value, " \t")
+		case "Pid":
+			pid, err := strconv.ParseInt(value, 10, 32)
+			if err != nil {
+				return Process{}, err
+			}
+			process.Pid = int(pid)
+		case "PPid":
+			ppid, err := strconv.ParseInt(value, 10, 32)
+			if err != nil {
+				return Process{}, err
+			}
+			process.Parent = int(ppid)
+		}
+
+	}
+	return process, nil
 }
 
 // Tree is a tree of processes.
@@ -135,8 +116,46 @@ type Tree struct {
 
 // Process stores informations about a UNIX process
 type Process struct {
-	Name     string
-	Pid      int
-	Parent   int
-	Children []int
+	Name      string
+	Pid       int
+	Parent    int
+	Children  []int
+	StartTime int64
+}
+
+type byModTime []Process
+
+func (bmt byModTime) Len() int      { return len(bmt) }
+func (bmt byModTime) Swap(i, j int) { bmt[i], bmt[j] = bmt[j], bmt[i] }
+func (bmt byModTime) Less(i, j int) bool {
+	return bmt[i].StartTime < bmt[j].StartTime
+}
+
+// Children returns a slice of all children processes
+func (t Tree) Children(pid int) []Process {
+	subTree := []Process{t.Procs[pid]}
+
+	switch t.Procs[pid].Children {
+	case nil:
+		return subTree
+
+	}
+	for _, p := range t.Procs[pid].Children {
+		subs := t.Children(p)
+		subTree = append(subTree, subs...)
+	}
+	return subTree
+}
+
+// SubTreeMapID returns a map of all children processes with ID's assigned by creation time
+func (t Tree) SubTreeMapID(pid int) map[string]int {
+	mapWithID := make(map[string]int)
+	subTree := t.Children(pid)
+
+	sort.Sort(byModTime(subTree))
+	for i, proc := range subTree {
+
+		mapWithID[strconv.Itoa(proc.Pid)] = i + 1
+	}
+	return mapWithID
 }
